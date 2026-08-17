@@ -10,6 +10,7 @@ Default model: gemini-2.5-flash-lite (override with GEMINI_MODEL).
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .config import settings
@@ -18,9 +19,13 @@ SYSTEM_INSTRUCTION = (
     "You are the assistant of a personal memory agent for VinUni Lab 17. "
     "Answer the user grounded ONLY in the retrieved memory context provided. "
     "If the context does not contain the answer, say so plainly instead of "
-    "inventing facts. Be concise and cite the concrete markers/ids you used. "
+    "inventing facts. Do not repeat or quote the user's long prompt. "
+    "Give a complete, practical answer with short sections and cite the "
+    "concrete markers/ids you used. "
     "You may reply in the user's language (Vietnamese or English)."
 )
+
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def gemini_available() -> bool:
@@ -43,18 +48,55 @@ def _to_contents(history: list[dict[str, str]]) -> list[dict[str, Any]]:
     return contents
 
 
+def _status_code(exc: Exception) -> int | None:
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    code = _status_code(exc)
+    if code in RETRYABLE_STATUS_CODES:
+        return True
+
+    text = f"{type(exc).__name__}: {exc}".casefold()
+    retryable_markers = (
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "unavailable",
+        "overloaded",
+        "rate limit",
+        "temporarily",
+        "timeout",
+    )
+    return any(marker in text for marker in retryable_markers)
+
+
 def generate_reply(
     memory_context: str,
     history: list[dict[str, str]],
     user_message: str,
     *,
     model: str | None = None,
+    retries: int = 3,
+    base_delay: float = 1.0,
 ) -> str:
     """Generate a grounded assistant reply with Gemini.
 
-    Raises RuntimeError if no key, and lets SDK/network errors bubble up so the
-    UI can surface them. `history` should include the latest user turn or not —
-    `user_message` is appended as the final user turn regardless.
+    Retries transient SDK/network errors with exponential backoff, then lets the
+    final error bubble up so the UI can fall back to retrieved context.
+    `history` should include the latest user turn or not; `user_message` is
+    appended as the final user turn regardless.
     """
     if not settings.gemini_api_key:
         raise RuntimeError(
@@ -81,13 +123,26 @@ def generate_reply(
     contents = _to_contents(history)
     contents.append({"role": "user", "parts": [{"text": grounding}]})
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.3,
-            max_output_tokens=800,
-        ),
-    )
-    return (getattr(response, "text", "") or "").strip()
+    attempts = max(1, retries)
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.3,
+                    max_output_tokens=settings.gemini_max_output_tokens,
+                ),
+            )
+            return (getattr(response, "text", "") or "").strip()
+        except Exception as exc:
+            last_error = exc
+            if attempt == attempts - 1 or not _is_retryable_error(exc):
+                raise
+            time.sleep(base_delay * (2**attempt))
+
+    if last_error:
+        raise last_error
+    return ""
